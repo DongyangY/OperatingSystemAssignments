@@ -1,0 +1,377 @@
+ +--------------------------+
+       	       	     |		ECE 434		|
+		     | PROJECT 2: USER PROGRAMS	|
+		     | 	   DESIGN DOCUMENT     	|
+		     +--------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Dongyang Yao <dy169@scarletmail.rutgers.edu>
+Zhijie Zhang <zz196@scarletmail.rutgers.edu>
+
+Contribution:
+Every member contributes equally.
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+   We passed 75 tests except for multi-oom using qemu (recommanded) or bochs.
+   If the result on your computer is different, pls. contact us.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+			   ARGUMENT PASSING
+			   ================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+// threads/thread.h
+struct thread
+{
+  ...
+  int fn_argc;
+  ...
+};
+
+fn_argc: store the number of tokenized arguments passed from process execute
+in order to setup stack.
+
+---- ALGORITHMS ----
+
+>> A2: Briefly describe how you implemented argument parsing.  How do
+>> you arrange for the elements of argv[] to be in the right order?
+
+To implement argument parsing, we need to tokenize the arguments and push
+the content of args, the address of args in stack, the address of argv,
+the argc, and the faked return address into the stack. We use strtok_r to
+tokenize the args and esp pointer to access the stack.
+
+For details, we first count the argc - number of arguments by tokenizing 
+a copy of file_name in start_process and store the argc in fn_argc 
+of the current thread. Then, in the setup_stack, we retrieve the argc from 
+fn_argc and malloc a argv array to store the content of args and a argv_addr 
+array to store the address of args in stack. Since we know the argc, we malloc
+the arrays in fixed size instead of dynamically reallocating them. Then, we
+tokenize the file_name and store the content of args into the argv array.
+During pushing the element of argv array into stack, we record the address of esp
+in argv_addr array. After that, we make a word alignment by 4 and add a null
+pointer sentineul to argc_addr array. To push the element of argv_addr in stack,
+we must keep the reversed order. And finally, we push the argv, argc and fake return
+address into stack.
+
+To arrange the elements of argv[] (in our code is argv_addr) in right order, 
+we store the address of args during push the contents of args into stack in
+normal order. Then, when pushing the address of args, we loop the argv_addr
+from end to start, thus the the address of args in stack will be in reversed
+order, i.e., in the right order.
+
+---- RATIONALE ----
+
+>> A3: Why does Pintos implement strtok_r() but not strtok()?
+
+To use strtok_r, we need to pass a save_ptr pointer which records the next 
+position of tokens. However, strtok will have an inner position pointer.
+Pintos implements strtok_r instead of strtok because of the possibility of
+race condition on the inner position pointer of strtok accessed from
+different threads. 
+
+>> A4: In Pintos, the kernel separates commands into a executable name
+>> and arguments.  In Unix-like systems, the shell does this
+>> separation.  Identify at least two advantages of the Unix approach.
+
+1) The first advantage is the performance. If we parse the arguments and 
+check errors in the shell interface between the user and the kernel, we 
+could reduce the operation cost in the kernel. Because an invalid arguments 
+checked out by shell will directly remind the user instead of going into 
+the kernel and cause panic.
+
+2) The second advantage is the design. Moving the complexity of argument
+error checking into shell interface will make the kernel more concentrate
+on its own job. This design will benefit the debug phase.
+
+
+			     SYSTEM CALLS
+			     ============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+// userprog/syscall.h
+struct child_process
+{
+  int pid;
+  int status_reg;
+  int ret;
+  struct semaphore sema_child_load;
+  struct semaphore sema_child_exit;
+  struct list_elem elem;
+};
+
+pid: record the thread tid for running this process.
+status_reg: 0th bit stands for if the child is being waited by its parent.
+1th and 2th bits stand for child's not loaded, loaded and load failed status.
+ret: record the return status of the child.
+sema_child_load: block the parent process until the child is loaded. It is used
+in process execute.
+sema_child_exit: block the parent process until the child exits. It is used in
+process wait and exit.
+elem: could be contained by a list.
+
+struct process_file
+{
+  struct file *file;
+  int fd;
+  struct list_elem elem;
+};
+
+struct lock lock_f;
+
+file: keep the file reference to access given fd.
+fd: the index (file descriptor) of this file in this thread. There could be duplicate
+fd in different threads. For the same file be opened twice, there would be 2 fd for it.
+elem: list element.
+lock_f: we need to treat the filesys access as a critical section, thus using a lock.
+
+// userprog/syscall.c
+bool is_lock_init;
+
+is_lock_init: for the first time lock_f initialization.
+
+// threads/thread.h
+struct thread
+{
+  ...
+  struct list child_list;
+  tid_t parent;
+  struct child_process *cp;
+  struct list file_list;
+  int next_fd;
+  struct file *executable;
+  ...
+};
+
+child_list: keep the child processes owned by this process.
+parent: keep the parent process of this process.
+cp: the reference of the child process struct of this thread in
+its parent child process list.
+file_list: keep the file being opened by this thread. The list stores
+the instance of process_file struct.
+next_fd: the next index (file descriptor) for a new opened file.
+0 and 1 are reserved for the console.
+executable: keep the process executable file. When the process terminated,
+we need to file_allow_write this file again.
+
+>> B2: Describe how file descriptors are associated with open files.
+>> Are file descriptors unique within the entire OS or just within a
+>> single process?
+
+Each process has a next_fd counter increased by 1 from 2 (0 and 1 
+are reserved for the console) when opening a new file, and the next_fd
+will be assigned to the file's fd. 
+
+File descriptors are unique in a single process. Since each process
+has its own next_fd counter, thus there will be the same fd in different
+processes. But in one process, the fd is unique. Also, if a file is
+opened by the same process twice, there will be two different fd assigned.
+
+
+---- ALGORITHMS ----
+
+>> B3: Describe your code for reading and writing user data from the
+>> kernel.
+
+1) Get the pointers for NUMBER, fd, buffer and size arguments from 
+esp stack pointer. 
+2) Check if the pointers are valid. The valid means it should be between 
+the PHYS_BASE and the code segment, and existing in page table. If not, 
+syscall exit with status -1.
+3) Check if the size is larger than 0, if not return size.
+4) Check if each char pointer in buffer within the range of size is
+valid. If not, syscall exit with status -1.
+5) For reading, check if fd is 0 while checking if fd is 1 for writing.
+If yes, then it is the console, and use input_getc for reading and 
+putbuf for writing directly.
+6) If fd is not 0 or 1, then it is an opening file for the current process.
+We acquire the lock for the file system, then get the file reference
+from file_list of current thread given fd. If the file reference exists,
+we use file_read or file_write to do byte operation and return number of bytes. 
+If not exists, return -1. Before return, we need to release the lock.  
+7) Return value is stored into eax register.
+
+
+>> B4: Suppose a system call causes a full page (4,096 bytes) of data
+>> to be copied from user space into the kernel.  What is the least
+>> and the greatest possible number of inspections of the page table
+>> (e.g. calls to pagedir_get_page()) that might result?  What about
+>> for a system call that only copies 2 bytes of data?  Is there room
+>> for improvement in these numbers, and how much?
+
+The least possible number of inspections is 1. This happens when 
+all 4096 bytes are in one page. The greatest possible number of inspections
+is 4096 when every byte is in a different page - 4096 pages in total.
+
+If copy 2 bytes, the least number of inspections is 1 when they are in
+one page and the greatest possible number of inspections is 2 when they
+are in different page.
+
+Yes. To improve it, we need to put bytes in as least as possible number
+of pages. Assume n bytes, then number of inspections will be:
+if (n % 4096 == 0) inspections = n / 4096
+else inspections = n / 4096 + 1
+
+>> B5: Briefly describe your implementation of the "wait" system call.
+
+From parent process view:
+1) Check if the pointer of NUMBER and pid arguments are valid.
+2) Get the child_process reference in this process's child_list 
+given child's pid.
+3) If no this child or the child is already being waiting, return status -1.
+To check if the child is being waiting, we check the 0th bit of status_reg
+of the child process struct.
+4) Sema down the sema_child_exit of the child. If the child did not exit, 
+the parent process will be blocked here.
+5) Get the return status from exited child.
+6) Remove the exited child reference in parent's child_list.
+7) Free the exited child struct.
+8) Return the status in eax register.  
+
+From chid process view:
+When the child process goes to process exit, it need to sema up its sema_child_exit.
+
+>> B6: Any access to user program memory at a user-specified address
+>> can fail due to a bad pointer value.  Such accesses must cause the
+>> process to be terminated.  System calls are fraught with such
+>> accesses, e.g. a "write" system call requires reading the system
+>> call number from the user stack, then each of the call's three
+>> arguments, then an arbitrary amount of user memory, and any of
+>> these can fail at any point.  This poses a design and
+>> error-handling problem: how do you best avoid obscuring the primary
+>> function of code in a morass of error-handling?  Furthermore, when
+>> an error is detected, how do you ensure that all temporarily
+>> allocated resources (locks, buffers, etc.) are freed?  In a few
+>> paragraphs, describe the strategy or strategies you adopted for
+>> managing these issues.  Give an example.
+
+To clearly manage this bad pointer issue, at the begining of each 
+system call, we will check the pointer of NUMBER and the following 
+arguments. If they are not between the PHYS_BASE and code segment
+approximately 0x08048000, and if they are get null by calling
+pagedir_get_page, the syscall exit with -1 will be triggered.
+Because we know the number of args for each syscall in advance,
+we could assign each argument locally in the syscall function.
+For allcated resources such as lock, if an error happens and we 
+accquire the lock before, we will definitely release it before return.
+
+For example, in write system call, we firstly get the pointer of
+fd, buffer and size arguments, and check if them valid. Then, we 
+check if the char pointers in buffer valid. To write to a file,
+we need to acquire the lock_f. And if an error happens during writing
+such as get a null file, we will release the lock before return error.  
+
+
+---- SYNCHRONIZATION ----
+
+>> B7: The "exec" system call returns -1 if loading the new executable
+>> fails, so it cannot return before the new executable has completed
+>> loading.  How does your code ensure this?
+
+In the system call exec, after calling process_execute, we get the pid
+of the child process who is running the cmd line. And we check the load
+status of the child by 1th and 2th bits in status_reg. If it is not
+loaded, the parent process will be blocked by sema_down (sema_child_load).
+Then, after child process has loaded, it will update the load status 
+- success or fail to its status_reg, and then sema up its sema_child_load.
+Then, the parent process will be unblocked and checks that child's 
+status_reg 1th and 2th bits. If load failed, remove this child and free
+its struct and return -1. Else, return the child's pid to eax register.
+
+>> B8: Consider parent process P with child process C.  How do you
+>> ensure proper synchronization and avoid race conditions when P
+>> calls wait(C) before C exits?  After C exits?  How do you ensure
+>> that all resources are freed in each case?  How about when P
+>> terminates without waiting, before C exits?  After C exits?  Are
+>> there any special cases?
+
+If P waits C before C exits, P will be blocked by C's sema_child_exit semaphore
+until C exits.
+If P waits C after C exits, P will not be able to find the C in its child_list,
+and return -1.
+
+When a process exits, its resources such as thread struct will be freed in anycase,
+but its child process struct in its parent process will not be freed at the same time, 
+because it records the exit info of the child to its parent who check it later. 
+The parent process will ensure child process struct will be freed after it unbloced in 
+process wait. Also, the exiting process will free all resources in its own child_list 
+and file_list.
+
+If P terminates without waiting before C exits, then P will remove C's related info
+in its thread struct, and when C updates its info to its parent P, it will first check 
+if P is alive, i.e., if it is existing in all_list.
+
+If P terminates without waiting after C exits, it is no problem.
+
+A special case is that the child is killed by kernel without process exit.
+
+
+---- RATIONALE ----
+
+>> B9: Why did you choose to implement access to user memory from the
+>> kernel in the way that you did?
+
+For user-provided pointers, we not only check it is below the PHYS_BASE, 
+but also check it is by pagedir_get_page. In this way, it will not cause
+page fault, and we do not need to deal with page fault handler.
+The reason we use pagedir_get_page to check the pointer before it causes
+a page fault is that this is more easy to implement.
+
+>> B10: What advantages or disadvantages can you see to your design
+>> for file descriptors?
+
+In our design, we make each process has its own file descriptor counter for 
+assignment instead of a global file descriptor controller for all processes.
+
+Advantages:
+1) The global file descriptor controller must also contain the pid for each 
+file opening. It wastes space.
+2) The global file descriptor controller's list will be longer, the searching
+time will be longer. While for process-based file descriptor controller will
+only need to search in the list of the thread opened that file.
+3) Because it is not centralized, so less contention to file system lock.
+
+Disadvantages:
+1) the global file descriptor controller is more easy to build and debug.
+
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Any other comments?

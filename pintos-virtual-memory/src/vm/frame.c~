@@ -1,0 +1,129 @@
+#include "threads/malloc.h"
+#include "threads/palloc.h"
+#include "threads/synch.h"
+#include "threads/thread.h"
+#include "userprog/pagedir.h"
+#include "userprog/syscall.h"
+#include "vm/frame.h"
+#include "vm/page.h"
+#include "vm/swap.h"
+#include "filesys/file.h"
+
+// P3: initialze frame table.
+void 
+frame_table_init ()
+{
+  list_init (&frame_table);
+  lock_init (&frame_table_lock);
+}
+
+// P3: obtain a frame from user pool.
+void * 
+frame_alloc (enum palloc_flags fg, struct sup_page_entry *spte)
+{
+  // P3: the frames used for user pages should be obtained from
+  // the user pool and return if it is not.
+  if ((fg & PAL_USER) == 0) return NULL;
+
+  void *f = palloc_get_page (fg);
+
+  // P3: if no frame is free, need to evict some pages.
+  while (!f)
+    {
+      f = frame_evict (fg);
+      lock_release (&frame_table_lock);
+    }
+  
+  // P3: insert it into frame table.
+  frame_add_to_table (f, spte);
+
+  return f;
+}
+
+// P3: delete a frame from frame table.
+void 
+frame_free (void *f)
+{ 
+  lock_acquire (&frame_table_lock);
+  
+  struct list_elem *e;
+  for (e = list_begin (&frame_table); e != list_end (&frame_table);
+       e = list_next (e))
+    {
+      struct frame_entry *fte = list_entry (e, struct frame_entry, elem);
+      if (fte->frame == f)
+	{
+	  list_remove (e);
+	  free (fte);
+	  palloc_free_page (f);
+	  break;
+	}
+    }
+
+  lock_release (&frame_table_lock);
+}
+
+// P3: insert a frame table entry.
+void 
+frame_add_to_table (void *f, struct sup_page_entry *spte)
+{
+  struct frame_entry *fte = malloc (sizeof (struct frame_entry));
+  fte->frame = f;
+  fte->spte = spte;
+  fte->thread = thread_current ();
+  lock_acquire (&frame_table_lock);
+  list_push_back (&frame_table, &fte->elem);
+  lock_release (&frame_table_lock);
+}
+
+// P3: eviction policy.
+void * 
+frame_evict (enum palloc_flags fg)
+{
+  lock_acquire (&frame_table_lock);
+
+  struct list_elem *e = list_begin (&frame_table);
+  while (true)
+    {
+      struct frame_entry *fte = list_entry(e, struct frame_entry, elem);
+
+      // P3: if it is not in use.
+      if (!fte->spte->pinned)
+	{
+	  struct thread *t = fte->thread;
+	  if (pagedir_is_accessed (t->pagedir, fte->spte->uva))
+	    pagedir_set_accessed (t->pagedir, fte->spte->uva, false);
+	  else
+	    {
+	      if (pagedir_is_dirty (t->pagedir, fte->spte->uva) ||
+		  fte->spte->type == SWAP)
+		{
+		  if (fte->spte->type == MMAP)
+		    {
+		      lock_acquire (&filesys_lock);
+		      file_write_at (fte->spte->file, fte->frame,
+				     fte->spte->read_bytes,
+				     fte->spte->offset);
+		      lock_release (&filesys_lock);
+		    }
+		  else
+		    {
+		      fte->spte->type = SWAP;
+		      fte->spte->swap_index = swap_out (fte->frame);
+		    }
+		}
+
+	      fte->spte->is_loaded = false;
+	      list_remove (&fte->elem);
+	      pagedir_clear_page (t->pagedir, fte->spte->uva);
+	      palloc_free_page (fte->frame);
+	      free (fte);
+	      return palloc_get_page (fg);
+	    }
+	}
+
+      // P3: simulate circular list.
+      e = (list_next (e) == list_end (&frame_table)) ?
+	list_begin (&frame_table) : list_next (e);
+    }
+}

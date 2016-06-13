@@ -1,0 +1,341 @@
+			+--------------------+
+			|       ECE 434      |
+			| PROJECT 1: THREADS |
+			|   DESIGN DOCUMENT  |
+			+--------------------+
+				   
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Dongyang Yao <dy169@scarletmail.rutgers.edu>
+Zhijie Zhang <zz196@scarletmail.rutgers.edu>
+
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, please give them here.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+			     ALARM CLOCK
+			     ===========
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+// devices/timer.c
+
+// Collect blocked threads due to sleep in descending order
+   by the ticks (i.e. wait_until_ticks) on which they should be woke up.
+static struct list wait_list;
+
+// threads/thread.h
+
+// Add a member which is the ticks when the thread should be
+   woke up by timer interrupt since OS booted.
+struct thread 
+{
+  ...
+  int64_t wait_until_ticks;
+  ... 
+};	
+
+---- ALGORITHMS ----
+
+>> A2: Briefly describe what happens in a call to timer_sleep(),
+>> including the effects of the timer interrupt handler.
+
+Call timer_sleep ():
+1) Check if sleep ticks valid.
+2) Diable the interrupt.
+3) Set current_thread ()'s wait_until_ticks to 
+   (ticks since OS booted + sleep ticks).
+4) Orderedly insert the current thread elem to
+   wait_list in descending order.
+5) Call thread_block () to give up the CPU and
+   schedule () next process.
+6) Restore the previous interrupt status.
+
+Effects of timer_interrupt ():
+1) Increase the system ticks (i.e. ticks since OS booted) by 1.
+2) Iteratively remove the last thread elem from wait_list and
+   wake up it (i.e. thread_unblock () to put it in ready_list)
+   until the thread's wait_until_ticks > system ticks.
+3) thread_tick () to check preemption due to TIME_SLICE.
+4) The thread woke up may have a higher priority than current
+   running thread, so check the ready_list, and if yes, call
+   intr_yield_on_return () to preempt.
+
+There is no bad effect (i.e. race condition on shared wait_list )
+of timer_interrupt () on timer_sleep (), since in timer_sleep (),
+the interrupt is turned off.
+
+---- SYNCHRONIZATION ----
+
+>> A3: How are race conditions avoided when multiple threads call
+>> timer_sleep() simultaneously?
+
+Since multiple threads call timer_sleep () to write the shared wait_list,
+there would be race condition. We turn off the interrupt in timer_sleep (),
+so there is no context switching (i.e. the opertion in timer_sleep is atomic),
+thus no race condition.
+
+In fact, this race condition could be avoided by sychronizations such as lock.
+However, there is another race condition between timer_sleep () and 
+timer_interrupt () to shared wait_list which could not be avoided by sychronization 
+because the timer_interrupt () is in interrupt context - not process and it could
+not use sychronization. Thus, we disable interrupt to avoid those two race conditions
+instead of sychronization.
+
+
+---- RATIONALE ----
+
+>> A4: Why did you choose this design?  In what ways is it superior to
+>> another design you considered?
+
+1) We keep the wait_list sorted. This will make the time complexity of 
+insertion in timer_sleep () O(n) where n is number of threads in wait_list
+and remove the least wait_until_ticks O(1) in timer_interrupt (). 
+Alternatively, we could not keep it sorted, then the insertion will be O(1) 
+and remove the least will be O(n). The former one is better because the
+frequency of timer_interrupt () is much higher than timer_sleep (), thus
+the time spent in timer_interrupt () should be as less as possible.
+
+2) We disable the interrupt in timer_sleep () instead of sychronization to
+avoid race conditions. This is due to sychronization could not solve the 
+race condition between thread (or process) and interrupt.
+
+
+			 PRIORITY SCHEDULING
+			 ===================
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+// threads/synch.h
+
+// Add list_elem in lock struct because thread struct contains
+   a list of acquired locks.
+struct lock
+{
+  ...
+  struct list_elem elem;
+  ...
+};
+
+// threads/thread.h
+
+// Limit on depth of nested priority donation.
+#define PRI_DONATION_MAX_DEPTH 8
+
+// Add three members to track priority donation.
+struct thread
+{
+  ...
+  // This is the priority before donated with a higher one or 
+     directly set by thread_set_priority (). It is mainly used 
+     to restore the priority when releasing the lock if there
+     is no another higher one donated.
+  int original_priority;
+  
+  // Collect the locks this thread currently holds.
+  struct list acquired_locks;
+
+  // Track the lock this thread is waiting on. NULL if it is 
+     not blocked by lock.
+  struct lock *wait_for_lock;
+  ...
+};
+
+>> B2: Explain the data structure used to track priority donation.
+>> Use ASCII art to diagram a nested donation.  (Alternately, submit a
+>> .png file.)
+
+          ready_list                           CPU  
+     +-------------------+                   +-----+              
+     | ... |T1(40)|T2(50)|                   |  T? |
+     +------+-+----------+    holder         +-----+                       
+            | |<-----------------------+
+            | |<-----------------+     |
+  acquired  | |<-----------+     |     |
+            | |<------+    |     |     |
+            | |       |    |     |     |
+            |      +--+----+-----+-----+--+                        
+            +----->| L1 | L2  | L3  | ... |
+                   +--+-------------------+ 
+                      ^  wait for
+                      |
+                   +--+-----------------------+                        
+                   | T3(20) | T4  | T5  | ... |
+                   +------+-------------------+
+                          ^
+                          |  holder
++-------+   acquiring  +--+-------------------+                        
+|T6(63) +--------------+ L4 | L5 |  L6  | ... |
++-------+              +----------------------+  
+
+To track the priority donation, we mainly use the list - acquired_locks and
+the waiting lock - wait_for_lock in each thread. As the diagram above shown, 
+let's say, T6 with priority 63 is acquring L4. The T6 will wait for L4 held
+by T3 which is waiting for L1 held by T1. But since T2 (priority 50) has a 
+higher priority than T1 (40) and T3 (20), thus CPU will run: 
+
+   T2 -> T1 -> T3 (before release) -> T6 ->T3 (after release).
+
+Here, T2 ---> T6 is a priority inversion and note there is no lock relationship
+between them. What we are going to do is boosting both T3 and T1's priority
+to 63, then CPU will run:
+
+   T1 (before release) -> T3 (before release) -> T6 -> T2 -> T1 (after release) -> T3 (after release)
+
+This is the priority donation. Note that we will boost each holder's priority if needed (see B4) in lock path, 
+and drop down its priority to the next highest priority among its original priority and priorities of all 
+threads who are waiting for the locks it holds. With this data structure, We can easily access T3 by L4->holder, 
+and access L1 by T3->wait_for_lock. 
+
+---- ALGORITHMS ----
+
+>> B3: How do you ensure that the highest priority thread waiting for
+>> a lock, semaphore, or condition variable wakes up first?
+
+1) semaphore: 
+We modified the sema_up function in synch.c file. Instead of directly unblocking the first thread
+in waiters list, we sort it in descending order by thread's priority before poping the first thread.
+After sorting, the first thread in waiters list is with highest priority, so we remove it in list
+and unblock it.
+
+2) lock:
+The lock struct is implemented by semaphore with value 1. When releasing the lock, it calls sema_up
+function, thus the highest priority thread waiting for the lock will be woke up first.
+
+3) condition:
+Conditional variable contains a list of semaphore_elem. Each semaphore_elem contains a semaphore with
+a list of thread waiters. In cond_signal function, we sort the semaphore_elems in conditional
+variable by the max priority of thread waiters in each semaphore_elem in descending order, then we 
+call sema_up to the first semaphore_elem's semaphore instance. Thus, the unblocked thread will be 
+the highest priority thread in all waiters of every semaphore_elem's semaphore.  
+
+Note that in sema_up (), the highest priority thread waiting for a sychronization will be orderedly 
+put into ready_list by thread_unblock () and then we check if the unblocked thread has a higher 
+priority than current running thread, if yes, we do thread_yeild () to preempt.
+
+>> B4: Describe the sequence of events when a call to lock_acquire()
+>> causes a priority donation.  How is nested donation handled?
+
+The basic idea of priority donation is mentioned in B2. The sequence of events for lock_acquire ():
+1) Check if the lock is belonged to a holder. If no, jump to 8).
+2) Set the lock to current thread's wait_for_lock.
+3) Disable interrupt.
+4) Set the priority of the holder of the lock to the 
+   max (current thread's priority, holder's original priority, holder's current priority).
+5) Set the lock to the holder's wait_for_lock. If there is no wait_for_lock for the holder
+   (i.e. it is in ready_list), then reorder it in ready_list to keep the order,
+   restore interrupt, then jump to 8).
+6) Restore interrupt.
+7) If not exceed the max priority donation depth, jump to 3).
+8) sema_down () the current thread.
+9) Disable interrupt. (Come here if not blocked or after unblocked by previous holder).
+10) Set current thread's wait_for_lock to NULL.
+11) Set the lock's holder to current thread.
+12) Insert the lock to current thread's acquired_locks list.
+13) Restore interrupt.
+
+The nested donation is handled by a loop. We will break the loop due to either exceeding
+the max depth or reach the thread which has no wait_for_lock and in ready_list. We use
+lock->holder and thread->wait_for_lock to climb the donation chain. 
+ 
+For more details about algorithm, please see the lock_acquire () in synch.c and 
+thread_priority_donation () in thread.c.
+
+Note that the lock_release () is also an important part of priority donation algorithm.
+The big idea is that we need to set the priority of the thread who just release a lock
+to the next highest priority among its original priority (may changed by thread_set_priority ())
+and all priorities of waiting threads for its other acquired locks.
+
+For more details about algorithm, please see the lock_release () in synch.c and
+thread_next_priority () in thread.c. 
+
+---- SYNCHRONIZATION ----
+
+>> B5: Describe a potential race in thread_set_priority() and explain
+>> how your implementation avoids it.
+
+There would be a race condition between updating the current thread's priority
+by thread_set_priority () and updating that priority by another thread's
+priority donation when acquring the lock held by the current thread or in its 
+lock chain. To avoid this race condition, we disable the interrupt in
+thread_set_priority (). 
+
+Note that we should not change the priority if it is donated in thread_set_priority (), 
+so we update the original_priority instead, and the priority will resume to original_priority 
+in lock release phase only if there is no higher priority donated by other waiters of locks it held.
+And we will directly update the priority in thread_set_priority () only if the new_priority 
+is less than priority and the priority is not donated, and we need to check the preemption here 
+since the new_priority may be lower than a ready thread. This makes the donation logically 
+right even thread_set_priority () is called.  
+
+There is no race condition between thread_set_priority () and thread_set_priority (),
+because it is updating the current thread's priority, so there is no situation to access the
+shared priority from different threads.
+
+---- RATIONALE ----
+
+>> B6: Why did you choose this design?  In what ways is it superior to
+>> another design you considered?
+
+1) The first consideration is if we need to keep the ready_list sorted.
+The insertion will be called when a thread is unblocked, i.e. creating
+a new thread, waking up a thread from sleeping or synchronization.
+Getting the max priority thread in ready_list operation will be
+triggered when context switching i.e. thread_yield () or intr_yield_on_return ().
+The latter is much more frequent than insertion, thus we should keep
+the ready_list sorted to quickly find the max priority thread in O(1) time, 
+instead of one pass in O(n) time.
+
+2) The second consideration is if we need to keep the waiters of a semaphore
+sorted. To keep the waiters sorted by priority, ordered insertion in sema_down 
+is not enough since the waiters' priority may be changed due to priority donation,
+thus when it comes to sema_up we cannot assume the waiters list is sorted. So,
+it is very expensive to keep it sorted all the time. Our decision is only sorting
+the waiters in sema_up, and keep the sema_down O(1) operation.
+
+3) The third consideration is if we need to keep the next priority the thread
+should be set when release the lock. Since the next priority should be
+the max priority among the original_priority and all priorities of waiters
+who waiting for the locks the current thread holds, the next priority could be
+changed in too many cases. Thus, we will do a brute force search here to get
+the next priority only in releasing lock phase.
+
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students, either for future quarters or the remaining projects?
+>> Any other comments?

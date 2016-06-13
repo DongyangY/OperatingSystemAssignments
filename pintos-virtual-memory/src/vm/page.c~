@@ -1,0 +1,228 @@
+#include <string.h>
+#include <stdbool.h>
+#include "threads/interrupt.h"
+#include "threads/malloc.h"
+#include "threads/palloc.h"
+#include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "userprog/pagedir.h"
+#include "userprog/process.h"
+#include "userprog/syscall.h"
+#include "vm/frame.h"
+#include "vm/page.h"
+#include "vm/swap.h"
+#include "filesys/file.h"
+
+static bool 
+install_page (void *upage, void *kpage, bool writable)
+{
+  struct thread *t = thread_current ();
+  return (pagedir_get_page (t->pagedir, upage) == NULL
+          && pagedir_set_page (t->pagedir, upage, kpage, writable));
+}
+
+static unsigned 
+page_hash_func (const struct hash_elem *e, void *aux)
+{
+  struct spage_table_entry *spte = hash_entry (e, struct spage_table_entry, elem);
+  return hash_int ((int) spte->upage);
+}
+
+static bool 
+page_less_func (const struct hash_elem *a,
+		const struct hash_elem *b,
+		void *aux)
+{
+  struct spage_table_entry *sa = hash_entry (a, struct spage_table_entry, elem);
+  struct spage_table_entry *sb = hash_entry (b, struct spage_table_entry, elem);
+  return (sa->upage < sb->upage) ? true : false;
+}
+
+static void 
+page_action_func (struct hash_elem *e, void *aux)
+{
+  struct spage_table_entry *spte = hash_entry (e, struct spage_table_entry,
+					    elem);
+  struct thread *t = thread_current ();
+  if (spte->in_memory)
+    {
+      frame_free (pagedir_get_page (t->pagedir, spte->upage));
+      pagedir_clear_page (t->pagedir, spte->upage);
+    }
+  free (spte);
+}
+
+void 
+spage_table_init (struct hash *spt)
+{
+  hash_init (spt, page_hash_func, page_less_func, NULL);
+}
+
+void 
+spage_table_free (struct hash *spt)
+{
+  hash_destroy (spt, page_action_func);
+}
+
+struct spage_table_entry * 
+spage_table_find (void *uaddr)
+{
+  struct spage_table_entry spte;
+  spte.upage = pg_round_down (uaddr);
+
+  struct hash_elem *e = hash_find (&thread_current()->spage_table, &spte.elem);
+  if (!e) return NULL;
+  return hash_entry (e, struct spage_table_entry, elem);
+}
+
+static bool 
+spage_table_load_swap (struct spage_table_entry *spte)
+{
+  uint8_t *f = frame_alloc (PAL_USER, spte);
+  if (!f) return false;
+  if (!install_page (spte->upage, f, spte->writable))
+    {
+      frame_free (f);
+      return false;
+    }
+  swap_in (spte->swap_slot_id, spte->upage);
+  spte->in_memory = true;
+  return true;
+}
+
+static bool 
+spage_table_load_file (struct spage_table_entry *spte)
+{
+  enum palloc_flags fg = PAL_USER;
+  if (spte->file_read_bytes == 0)
+    fg |= PAL_ZERO;
+  uint8_t *f = frame_alloc (fg, spte);
+  if (!f) return false;
+  if (spte->file_read_bytes > 0)
+    {
+      lock_acquire (&lock_f);
+      if ((int) spte->file_read_bytes != file_read_at (spte->file, f,
+						  spte->file_read_bytes,
+						  spte->file_offset))
+	{
+	  lock_release (&lock_f);
+	  frame_free (f);
+	  return false;
+	}
+      lock_release (&lock_f);
+      memset (f + spte->file_read_bytes, 0, spte->file_zero_bytes);
+    }
+
+  if (!install_page (spte->upage, f, spte->writable))
+    {
+      frame_free(f);
+      return false;
+    }
+
+  spte->in_memory = true;  
+  return true;
+}
+
+bool 
+spage_table_load (struct spage_table_entry *spte, enum spage_types type)
+{
+  bool success = false;
+  spte->inevictable = true;
+  if (spte->in_memory) return success;
+
+  if (type == SWAP)
+    {
+    
+    }
+
+  if (type == FILE || type == MMAP)
+    {
+    }
+
+  return success;
+}
+
+bool 
+add_file_to_page_table (struct file *file, int32_t ofs, 
+			uint8_t *upage, uint32_t read_bytes, 
+			uint32_t zero_bytes, bool writable)
+{
+  struct spage_table_entry *spte = malloc (sizeof (struct spage_table_entry));
+  if (!spte) return false;
+  spte->file = file;
+  spte->file_offset = ofs;
+  spte->upage = upage;
+  spte->file_read_bytes = read_bytes;
+  spte->file_zero_bytes = zero_bytes;
+  spte->writable = writable;
+  spte->in_memory = false;
+  spte->spage_type = FILE;
+  spte->inevictable = false;
+  return hash_insert (&thread_current ()->spage_table, &spte->elem) == NULL;
+}
+
+bool 
+add_mmap_to_page_table (struct file *file, int32_t ofs, 
+			uint8_t *upage, uint32_t read_bytes, 
+			uint32_t zero_bytes)
+{
+  struct spage_table_entry *spte = malloc (sizeof (struct spage_table_entry));
+  if (!spte) return false;
+  spte->file = file;
+  spte->file_offset = ofs;
+  spte->upage = upage;
+  spte->file_read_bytes = read_bytes;
+  spte->file_zero_bytes = zero_bytes;
+  spte->in_memory = false;
+  spte->spage_type = MMAP;
+  spte->writable = true;
+  spte->inevictable = false;
+
+  if (!mmap_alloc (spte))
+    {
+      free(spte);
+      return false;
+    }
+
+  if (hash_insert (&thread_current()->spage_table, &spte->elem))
+    {
+      spte->spage_type = ERROR;
+      return false;
+    }
+
+  return true;
+}
+
+bool 
+grow_stack (void *uaddr)
+{
+  if((size_t)(PHYS_BASE - pg_round_down (uaddr)) > (1 << 23))
+    return false;
+ struct spage_table_entry *spte = malloc (sizeof (struct spage_table_entry));
+  if (!spte)
+    return false;
+  spte->upage = pg_round_down(uaddr);
+  spte->in_memory = true;
+  spte->writable = true;
+  spte->spage_type = SWAP;
+  spte->inevictable = true;
+
+  uint8_t *f = frame_alloc (PAL_USER, spte);
+  if (!f)
+    {
+      free(spte);
+      return false;
+    }
+
+  if (!install_page (spte->upage, f, spte->writable))
+    {
+      free (spte);
+      frame_free (f);
+      return false;
+    }
+
+  if (intr_context ())
+    spte->inevictable = false;
+
+  return hash_insert (&thread_current ()->spage_table, &spte->elem) == NULL;
+}
